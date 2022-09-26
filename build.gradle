@@ -1,0 +1,26 @@
+plugins {
+    id 'java'
+    id 'application'
+    id "org.springframework.boot" version "2.7.4"
+    id 'com.github.ben-manes.versions' version '0.42.0'
+}
+
+group 'org.mikusch'
+version '1.0-SNAPSHOT'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation group: 'net.dv8tion', name: 'JDA', version: '5.0.0-alpha.20'
+    implementation group: 'club.minnced', name: 'discord-webhooks', version: '0.8.2'
+    implementation group: 'com.google.guava', name: 'guava', version: '31.1-jre'
+    implementation group: 'org.apache.commons', name: 'commons-lang3', version: '3.12.0'
+    implementation group: 'org.springframework.boot', name: 'spring-boot-starter-parent', version: '2.7.4'
+    implementation group: 'org.springframework.boot', name: 'spring-boot-starter', version: '2.7.4'
+}
+
+application {
+    mainClass = 'org.mikusch.MikuBot'
+}
