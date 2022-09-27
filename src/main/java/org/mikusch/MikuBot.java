@@ -12,13 +12,16 @@ import javax.security.auth.login.LoginException;
 import java.util.EnumSet;
 
 @SpringBootApplication
-public class MikuBot {
-    public static void main(String[] args) {
-        SpringApplication.run(MikuBot.class, args);
-    }
+public class MikuBot
+{
+	public static void main(String[] args)
+	{
+		SpringApplication.run(MikuBot.class, args);
+	}
 
-    @Bean(name = "jda")
-    public JDA getJDA(@Value("${discord.token}") String token) throws LoginException, InterruptedException {
-        return JDABuilder.create(token, EnumSet.allOf(GatewayIntent.class)).build().awaitReady();
-    }
+	@Bean(name = "jda")
+	public JDA getJDA(@Value("${discord.token}") String token) throws LoginException, InterruptedException
+	{
+		return JDABuilder.create(token, EnumSet.allOf(GatewayIntent.class)).build().awaitReady();
+	}
 }
