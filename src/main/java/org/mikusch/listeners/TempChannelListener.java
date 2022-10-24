@@ -1,4 +1,4 @@
-package org.mikusch;
+package org.mikusch.listeners;
 
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.ListMultimap;
