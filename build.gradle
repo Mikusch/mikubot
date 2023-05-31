@@ -1,7 +1,7 @@
 plugins {
     id 'java'
     id 'application'
-    id "org.springframework.boot" version "3.0.4"
+    id "org.springframework.boot" version "3.1.0"
     id 'com.github.ben-manes.versions' version '0.46.0'
 }
 
@@ -13,12 +13,12 @@ repositories {
 }
 
 dependencies {
-    implementation group: 'net.dv8tion', name: 'JDA', version: '5.0.0-beta.5'
+    implementation group: 'net.dv8tion', name: 'JDA', version: '5.0.0-beta.9'
     implementation group: 'club.minnced', name: 'discord-webhooks', version: '0.8.2'
-    implementation group: 'com.google.guava', name: 'guava', version: '31.1-jre'
+    implementation group: 'com.google.guava', name: 'guava', version: '32.0.0-jre'
     implementation group: 'org.apache.commons', name: 'commons-lang3', version: '3.12.0'
-    implementation group: 'org.springframework.boot', name: 'spring-boot-starter-parent', version: '3.0.4'
-    implementation group: 'org.springframework.boot', name: 'spring-boot-starter', version: '3.0.4'
+    implementation group: 'org.springframework.boot', name: 'spring-boot-starter-parent', version: '3.1.0'
+    implementation group: 'org.springframework.boot', name: 'spring-boot-starter', version: '3.1.0'
 }
 
 application {
