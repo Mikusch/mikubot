@@ -89,7 +89,11 @@ public class Thinker extends ListenerAdapter {
                         builder.addFiles(FileUpload.fromData(inputStream, attachment.getFileName()))
                 )).toArray(CompletableFuture[]::new);
 
-        CompletableFuture.allOf(futures).join();
+        try {
+            CompletableFuture.allOf(futures).get(30, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            log.warn("Failed to download attachments for message {}", message.getId(), e);
+        }
 
         return builder.setAllowedMentions(Set.of()).build();
     }
@@ -333,9 +337,9 @@ public class Thinker extends ListenerAdapter {
                                 }
 
                                 boolean isReply = !config.getTriggers().isEmpty() &&
-                                                  event.getMessage().getType() == MessageType.INLINE_REPLY &&
-                                                  event.getMessage().getReferencedMessage() != null &&
-                                                  event.getMessage().getReferencedMessage().getAuthor().getIdLong() == webhook.getDefaultUser().getIdLong();
+                                        event.getMessage().getType() == MessageType.INLINE_REPLY &&
+                                        event.getMessage().getReferencedMessage() != null &&
+                                        event.getMessage().getReferencedMessage().getAuthor().getIdLong() == webhook.getDefaultUser().getIdLong();
                                 boolean hasChatTrigger = config.getTriggers().stream()
                                         .anyMatch(trigger -> message.getContentDisplay().toLowerCase().contains(trigger.toLowerCase()));
 
@@ -348,12 +352,12 @@ public class Thinker extends ListenerAdapter {
 
     private boolean shouldSaveMessage(Message message) {
         return !message.getMentions().mentionsEveryone() &&
-               message.getChannelType().isGuild() &&
-               !(message.getContentRaw().isEmpty() && message.getEmbeds().isEmpty()
-                 && message.getAttachments().isEmpty() && message.getComponents().isEmpty()
-                 && message.getPoll() == null) &&
-               !message.getType().isSystem() &&
-               !message.isWebhookMessage();
+                message.getChannelType().isGuild() &&
+                !(message.getContentRaw().isEmpty() && message.getEmbeds().isEmpty()
+                        && message.getAttachments().isEmpty() && message.getComponents().isEmpty()
+                        && message.getPoll() == null) &&
+                !message.getType().isSystem() &&
+                !message.isWebhookMessage();
     }
 
     private RestAction<Message> sendRandomMessageImmediate(Webhook webhook, ThinkerConfig config) {
@@ -461,8 +465,8 @@ public class Thinker extends ListenerAdapter {
                         retrieveAvgDurationBetweenMessagesInChannel(channel).flatMap(duration -> {
                             OffsetDateTime lastPosted = lastPostedTimes.getOrDefault(config.getWebhookId(), OffsetDateTime.now());
                             if (duration != null &&
-                                OffsetDateTime.now().isAfter(lastPosted.plus(duration.multipliedBy(config.getDurationMultiplier()))) &&
-                                messageRepository.countByWebhookId(config.getWebhookId()) > 0) {
+                                    OffsetDateTime.now().isAfter(lastPosted.plus(duration.multipliedBy(config.getDurationMultiplier()))) &&
+                                    messageRepository.countByWebhookId(config.getWebhookId()) > 0) {
                                 if (latestMessage.getAuthor().getIdLong() == webhook.getDefaultUser().getIdLong()) {
                                     log.info("Latest message is already authored by webhook {}, refusing to post", config.getWebhookId());
                                     lastPostedTimes.put(config.getWebhookId(), latestMessage.getTimeCreated());
@@ -473,7 +477,7 @@ public class Thinker extends ListenerAdapter {
                             log.debug("Not enough time has passed yet for webhook {}, refusing to post", config.getWebhookId());
                             return new CompletedRestAction<>(jda, null);
                         }));
-            }).submit().whenComplete((msg, err) -> {
+            }).submit().orTimeout(30, TimeUnit.SECONDS).whenComplete((msg, err) -> {
                 if (err != null) {
                     log.error("Failed to send message for webhook {}", config.getWebhookId(), err);
                 }
