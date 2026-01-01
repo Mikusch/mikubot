@@ -13,7 +13,7 @@ repositories {
 }
 
 dependencies {
-    implementation("net.dv8tion:JDA:6.2.0")
+    implementation("net.dv8tion:JDA:6.2.1")
     implementation("org.springframework.boot:spring-boot-starter-data-jpa")
     implementation("com.h2database:h2")
     compileOnly("org.projectlombok:lombok")
