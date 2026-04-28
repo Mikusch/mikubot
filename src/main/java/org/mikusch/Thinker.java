@@ -84,13 +84,13 @@ public class Thinker extends ListenerAdapter {
     private static @NotNull MessageCreateData getCreateDataForMessage(Message message) {
         MessageCreateBuilder builder = MessageCreateBuilder.fromMessage(message);
 
-        var futures = message.getAttachments().stream().map(attachment ->
-                attachment.getProxy().download().thenAccept(inputStream ->
-                        builder.addFiles(FileUpload.fromData(inputStream, attachment.getFileName()))
-                )).toArray(CompletableFuture[]::new);
+        List<CompletableFuture<FileUpload>> futures = message.getAttachments().stream()
+                .map(attachment -> attachment.getProxy().download()
+                        .thenApply(inputStream -> FileUpload.fromData(inputStream, attachment.getFileName())))
+                .toList();
 
         try {
-            CompletableFuture.allOf(futures).get(30, TimeUnit.SECONDS);
+            builder.addFiles(futures.stream().map(CompletableFuture::join).toList());
         } catch (Exception e) {
             log.warn("Failed to download attachments for message {}", message.getId(), e);
         }
