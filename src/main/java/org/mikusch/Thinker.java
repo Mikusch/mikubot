@@ -95,7 +95,7 @@ public class Thinker extends ListenerAdapter {
             log.warn("Failed to download attachments for message {}", message.getId(), e);
         }
 
-        return builder.setAllowedMentions(Set.of()).build();
+        return builder.setAllowedMentions(EnumSet.of(Message.MentionType.USER)).build();
     }
 
     private Optional<ThinkerConfig> getConfigForChannel(long channelId) {
