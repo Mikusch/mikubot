@@ -1,5 +1,6 @@
 package org.mikusch;
 
+import java.util.EnumSet;
 import net.dv8tion.jda.api.JDA;
 import net.dv8tion.jda.api.JDABuilder;
 import net.dv8tion.jda.api.entities.Message;
@@ -10,8 +11,6 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
 import org.springframework.scheduling.annotation.EnableScheduling;
-
-import java.util.EnumSet;
 
 @SpringBootApplication
 @EnableScheduling
@@ -27,7 +26,9 @@ public class MikuBot {
             throw new IllegalStateException("Empty or blank Discord bot token provided");
         }
 
-        JDA jda = JDABuilder.create(token, EnumSet.allOf(GatewayIntent.class)).build().awaitReady();
+        JDA jda = JDABuilder.create(token, EnumSet.allOf(GatewayIntent.class))
+                .build()
+                .awaitReady();
 
         // Prevent @everyone and @here
         EnumSet<Message.MentionType> deny = EnumSet.of(Message.MentionType.EVERYONE, Message.MentionType.HERE);
@@ -38,5 +39,4 @@ public class MikuBot {
 
         return jda;
     }
-
 }

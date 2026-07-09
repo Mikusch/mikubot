@@ -1,6 +1,12 @@
 package org.mikusch;
 
 import jakarta.annotation.PostConstruct;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
 import lombok.extern.slf4j.Slf4j;
 import net.dv8tion.jda.api.JDA;
 import net.dv8tion.jda.api.Permission;
@@ -20,13 +26,6 @@ import org.jetbrains.annotations.NotNull;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Stream;
-
 @Service
 @Slf4j
 public class UltraPing extends ListenerAdapter {
@@ -44,8 +43,10 @@ public class UltraPing extends ListenerAdapter {
 
     @PostConstruct
     public void postConstruct() {
-        jda.getGuilds().forEach(guild ->
-                guild.upsertCommand(ULTRAPING_COMMAND_NAME, "Mentions a user in every channel, deleting each message immediately")
+        jda.getGuilds()
+                .forEach(guild -> guild.upsertCommand(
+                                ULTRAPING_COMMAND_NAME,
+                                "Mentions a user in every channel, deleting each message immediately")
                         .setDefaultPermissions(DefaultMemberPermissions.enabledFor(Permission.ADMINISTRATOR))
                         .addOption(OptionType.USER, ULTRAPING_USER_PARAM_NAME, "The user to ping", true)
                         .queue());
@@ -79,8 +80,7 @@ public class UltraPing extends ListenerAdapter {
         Member selfMember = guild.getSelfMember();
 
         List<GuildMessageChannel> channels = Stream.concat(
-                        guild.getChannels().stream(),
-                        guild.getThreadChannels().stream())
+                        guild.getChannels().stream(), guild.getThreadChannels().stream())
                 .filter(GuildMessageChannel.class::isInstance)
                 .map(GuildMessageChannel.class::cast)
                 .filter(channel -> !(channel instanceof ThreadChannel thread) || !thread.isArchived())
@@ -114,11 +114,11 @@ public class UltraPing extends ListenerAdapter {
         }
 
         CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new))
-                .whenComplete((ignored, _) -> hook.editOriginal(
-                        "Ultra-pinged %s across %d channel(s)%s.".formatted(
-                                mention,
-                                pinged.get(),
-                                failed.get() > 0 ? " (%d failed)".formatted(failed.get()) : "")
-                ).queue());
+                .whenComplete((ignored, _) -> hook.editOriginal("Ultra-pinged %s across %d channel(s)%s."
+                                .formatted(
+                                        mention,
+                                        pinged.get(),
+                                        failed.get() > 0 ? " (%d failed)".formatted(failed.get()) : ""))
+                        .queue());
     }
 }

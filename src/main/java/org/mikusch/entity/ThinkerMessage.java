@@ -22,5 +22,4 @@ public class ThinkerMessage {
     private Long guildId;
 
     private Long webhookId;
-
 }

@@ -1,11 +1,10 @@
 package org.mikusch.entity;
 
 import jakarta.persistence.*;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
 import java.util.ArrayList;
 import java.util.List;
+import lombok.Data;
+import lombok.NoArgsConstructor;
 
 @Entity
 @Table(name = "thinker_config")
@@ -19,13 +18,14 @@ public class ThinkerConfig {
     private Long channelId;
 
     @ElementCollection(fetch = FetchType.EAGER)
-    private List<String> triggers = new ArrayList<>();
+    private volatile List<String> triggers = new ArrayList<>();
 
     private long durationMultiplier = 40L;
+
+    private volatile Long presetMessageId;
 
     public ThinkerConfig(Long webhookId, Long channelId) {
         this.webhookId = webhookId;
         this.channelId = channelId;
     }
-
 }
