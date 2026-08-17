@@ -1,0 +1,126 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      PANEL_URL: ${{ secrets.PTERODACTYL_URL }}
+      API_KEY: ${{ secrets.PTERODACTYL_API_KEY }}
+      SERVER_ID: ${{ vars.PTERODACTYL_SERVER_ID }}
+      JAR_NAME: ${{ vars.JAR_NAME || 'mikubot.jar' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v5
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      - name: Build
+        run: ./gradlew bootJar
+
+      - name: Stop server
+        run: |
+          set -euo pipefail
+          panel="${PANEL_URL%/}"
+
+          curl -sSf -X POST "$panel/api/client/servers/$SERVER_ID/power" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Accept: application/vnd.pterodactyl.v1+json" \
+            -H "Content-Type: application/json" \
+            -d '{"signal":"stop"}'
+
+          current_state() {
+            curl -sSf "$panel/api/client/servers/$SERVER_ID/resources" \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Accept: application/vnd.pterodactyl.v1+json" \
+              | jq -r '.attributes.current_state'
+          }
+
+          for _ in $(seq 1 30); do
+            state=$(current_state)
+            echo "Server state: $state"
+            if [ "$state" = "offline" ]; then exit 0; fi
+            sleep 2
+          done
+
+          echo "Server did not stop gracefully, killing it"
+          curl -sSf -X POST "$panel/api/client/servers/$SERVER_ID/power" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Accept: application/vnd.pterodactyl.v1+json" \
+            -H "Content-Type: application/json" \
+            -d '{"signal":"kill"}'
+
+          for _ in $(seq 1 15); do
+            state=$(current_state)
+            echo "Server state: $state"
+            if [ "$state" = "offline" ]; then exit 0; fi
+            sleep 2
+          done
+
+          echo "Server is still not offline, aborting deploy" >&2
+          exit 1
+
+      - name: Upload jar
+        run: |
+          set -euo pipefail
+          panel="${PANEL_URL%/}"
+
+          upload_url=$(curl -sSf "$panel/api/client/servers/$SERVER_ID/files/upload?directory=%2F" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Accept: application/vnd.pterodactyl.v1+json" \
+            | jq -r '.attributes.url')
+
+          if [ -z "$upload_url" ] || [ "$upload_url" = "null" ]; then
+            echo "Failed to obtain a signed upload URL" >&2
+            exit 1
+          fi
+
+          curl -sSf -X POST "$upload_url&directory=%2F" \
+            -F "files=@build/libs/mikubot.jar;filename=$JAR_NAME"
+
+          echo "Uploaded $JAR_NAME"
+
+      - name: Start server
+        run: |
+          set -euo pipefail
+          panel="${PANEL_URL%/}"
+
+          curl -sSf -X POST "$panel/api/client/servers/$SERVER_ID/power" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Accept: application/vnd.pterodactyl.v1+json" \
+            -H "Content-Type: application/json" \
+            -d '{"signal":"start"}'
+
+          for _ in $(seq 1 30); do
+            state=$(curl -sSf "$panel/api/client/servers/$SERVER_ID/resources" \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Accept: application/vnd.pterodactyl.v1+json" \
+              | jq -r '.attributes.current_state')
+            echo "Server state: $state"
+            if [ "$state" = "running" ]; then exit 0; fi
+            sleep 2
+          done
+
+          echo "Server did not reach the running state in time" >&2
+          exit 1
+
+      - name: Restart server after a failed deploy
+        if: failure()
+        run: |
+          panel="${PANEL_URL%/}"
+          curl -sS -X POST "$panel/api/client/servers/$SERVER_ID/power" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Accept: application/vnd.pterodactyl.v1+json" \
+            -H "Content-Type: application/json" \
+            -d '{"signal":"start"}'

@@ -3,7 +3,8 @@ plugins {
     id("org.springframework.boot") version "4.1.0"
     id("io.spring.dependency-management") version "1.1.7"
     id("com.github.ben-manes.versions") version "0.56.0"
-    id("com.diffplug.spotless") version "8.8.0"
+    id("com.github.ben-manes.versions") version "0.54.0"
+    id("com.diffplug.spotless") version "8.9.0"
 }
 
 group = "org.mikusch"
@@ -19,6 +20,10 @@ dependencies {
     implementation("com.h2database:h2")
     compileOnly("org.projectlombok:lombok")
     annotationProcessor("org.projectlombok:lombok")
+}
+
+tasks.bootJar {
+    archiveFileName = "mikubot.jar"
 }
 
 spotless {

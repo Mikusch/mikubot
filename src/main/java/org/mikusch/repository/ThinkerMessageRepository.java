@@ -7,10 +7,12 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
 
 @Repository
 public interface ThinkerMessageRepository extends JpaRepository<ThinkerMessage, Long> {
 
+    @Transactional
     void deleteByWebhookIdAndMessageIdIn(Long webhookId, List<Long> messageIds);
 
     @Query(value = "SELECT * FROM thinker_messages WHERE webhook_id = ?1 ORDER BY RANDOM() LIMIT 1", nativeQuery = true)
