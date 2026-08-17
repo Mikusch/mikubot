@@ -21,6 +21,10 @@ dependencies {
     annotationProcessor("org.projectlombok:lombok")
 }
 
+tasks.bootJar {
+    archiveFileName = "mikubot.jar"
+}
+
 spotless {
     java {
         palantirJavaFormat("2.94.0")
