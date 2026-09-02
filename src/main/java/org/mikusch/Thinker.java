@@ -7,19 +7,26 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.stream.Stream;
 import lombok.extern.slf4j.Slf4j;
 import net.dv8tion.jda.api.JDA;
 import net.dv8tion.jda.api.Permission;
 import net.dv8tion.jda.api.entities.*;
-import net.dv8tion.jda.api.entities.channel.ChannelType;
+import net.dv8tion.jda.api.entities.channel.attribute.IAgeRestrictedChannel;
+import net.dv8tion.jda.api.entities.channel.concrete.ThreadChannel;
+import net.dv8tion.jda.api.entities.channel.middleman.GuildChannel;
 import net.dv8tion.jda.api.entities.channel.middleman.GuildMessageChannel;
+import net.dv8tion.jda.api.events.channel.ChannelDeleteEvent;
+import net.dv8tion.jda.api.events.channel.update.ChannelUpdateArchivedEvent;
 import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent;
 import net.dv8tion.jda.api.events.message.MessageBulkDeleteEvent;
 import net.dv8tion.jda.api.events.message.MessageDeleteEvent;
 import net.dv8tion.jda.api.events.message.MessageReceivedEvent;
 import net.dv8tion.jda.api.hooks.ListenerAdapter;
+import net.dv8tion.jda.api.interactions.InteractionHook;
 import net.dv8tion.jda.api.interactions.commands.DefaultMemberPermissions;
 import net.dv8tion.jda.api.interactions.commands.OptionMapping;
 import net.dv8tion.jda.api.interactions.commands.OptionType;
@@ -32,6 +39,7 @@ import net.dv8tion.jda.internal.requests.CompletedRestAction;
 import org.jetbrains.annotations.NotNull;
 import org.mikusch.entity.ThinkerConfig;
 import org.mikusch.entity.ThinkerMessage;
+import org.mikusch.entity.ThinkerMessageId;
 import org.mikusch.repository.ThinkerConfigRepository;
 import org.mikusch.repository.ThinkerMessageRepository;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -52,8 +60,13 @@ public class Thinker extends ListenerAdapter {
     private static final String THINKER_TRIGGER_COMMAND_TRIGGER_PARAM_NAME = "trigger";
     private static final String THINKER_SETUP_COMMAND_WEBHOOK_PARAM_NAME = "webhook";
     private static final String ALWAYS_BLOCKED_WORD = "thinker";
+    private static final String INVALID_MESSAGE_REFERENCE = "Invalid message ID or message link.";
     private static final int MAX_SEND_ATTEMPTS = 10;
+    private static final int COLLECT_BATCH_SIZE = 1000;
     private static final Duration SEND_LEASE_TIMEOUT = Duration.ofMinutes(2);
+    private static final Predicate<Throwable> UNAVAILABLE_MESSAGE_ERRORS = ErrorResponse.test(
+                    ErrorResponse.UNKNOWN_MESSAGE, ErrorResponse.UNKNOWN_CHANNEL, ErrorResponse.MISSING_ACCESS)
+            .or(UnavailableChannelException.class::isInstance);
 
     private final Map<Long, ThinkerConfig> configs = new ConcurrentHashMap<>();
     private final Map<Long, IncomingWebhookClient> clients = new ConcurrentHashMap<>();
@@ -75,6 +88,14 @@ public class Thinker extends ListenerAdapter {
         jda.addEventListener(this);
 
         configRepository.findAll().forEach(config -> configs.put(config.getWebhookId(), config));
+    }
+
+    private record MessageRef(long channelId, long messageId) {}
+
+    private static final class UnavailableChannelException extends RuntimeException {
+        private UnavailableChannelException(long channelId) {
+            super("Channel %d is not available as a source for this Thinker.".formatted(channelId));
+        }
     }
 
     public static Duration getAvgDurationBetweenMessages(List<Message> messages) {
@@ -138,6 +159,19 @@ public class Thinker extends ListenerAdapter {
         return getBlockedWords(config).anyMatch(searchableText::contains);
     }
 
+    private static boolean isAgeRestricted(GuildChannel channel) {
+        GuildChannel target = channel instanceof ThreadChannel thread ? thread.getParentChannel() : channel;
+        return target instanceof IAgeRestrictedChannel restricted && restricted.isNSFW();
+    }
+
+    private static ThinkerMessage toThinkerMessage(Message message, ThinkerConfig config) {
+        return new ThinkerMessage(
+                message.getIdLong(),
+                message.getChannel().getIdLong(),
+                message.getGuild().getIdLong(),
+                config.getWebhookId());
+    }
+
     private void discardBlockedMessage(Message message, ThinkerConfig config) {
         log.info(
                 "Message {} contains a blocked word, removing it from the pool of webhook {}",
@@ -146,22 +180,76 @@ public class Thinker extends ListenerAdapter {
         removeFromPool(message.getIdLong(), config);
     }
 
-    private void discardMissingMessage(long messageId, ThinkerConfig config) {
+    private void discardUnavailableMessage(MessageRef ref, ThinkerConfig config, Throwable cause) {
         log.info(
-                "Message {} no longer exists on Discord, removing it from the pool of webhook {}",
-                messageId,
+                "Message {} in channel {} is no longer available ({}), removing it from the pool of webhook {}",
+                ref.messageId(),
+                ref.channelId(),
+                cause.getMessage(),
                 config.getWebhookId());
-        removeFromPool(messageId, config);
+        removeFromPool(ref.messageId(), config);
     }
 
     private void removeFromPool(long messageId, ThinkerConfig config) {
-        messageRepository.deleteByWebhookIdAndMessageIdIn(config.getWebhookId(), List.of(messageId));
+        messageRepository.deleteByWebhookIdAndMessageId(config.getWebhookId(), messageId);
     }
 
     private Optional<ThinkerConfig> getConfigForChannel(long channelId) {
         return configs.values().stream()
                 .filter(c -> c.getChannelId().equals(channelId))
                 .findFirst();
+    }
+
+    private Optional<GuildMessageChannel> getDestinationChannel(ThinkerConfig config) {
+        return Optional.ofNullable(jda.getChannelById(GuildMessageChannel.class, config.getChannelId()));
+    }
+
+    private boolean isEligibleSource(GuildMessageChannel source, ThinkerConfig config) {
+        return getDestinationChannel(config)
+                .filter(destination ->
+                        destination.getGuild().getIdLong() == source.getGuild().getIdLong())
+                .filter(destination -> isAgeRestricted(destination) || !isAgeRestricted(source))
+                .isPresent();
+    }
+
+    private List<GuildMessageChannel> getSourceChannels(Guild guild, ThinkerConfig config) {
+        Member selfMember = guild.getSelfMember();
+        return Stream.concat(guild.getChannels().stream(), guild.getThreadChannels().stream())
+                .filter(GuildMessageChannel.class::isInstance)
+                .map(GuildMessageChannel.class::cast)
+                .filter(channel -> !(channel instanceof ThreadChannel thread) || !thread.isArchived())
+                .filter(channel ->
+                        selfMember.hasPermission(channel, Permission.VIEW_CHANNEL, Permission.MESSAGE_HISTORY))
+                .filter(channel -> isEligibleSource(channel, config))
+                .toList();
+    }
+
+    private Optional<MessageRef> resolveMessageRef(String input, ThinkerConfig config) {
+        String value = input.trim();
+        try {
+            Matcher link = Message.JUMP_URL_PATTERN.matcher(value);
+            if (link.matches()) {
+                return Optional.of(
+                        new MessageRef(Long.parseLong(link.group("channel")), Long.parseLong(link.group("message"))));
+            }
+
+            long messageId = Long.parseLong(value);
+            long channelId = messageRepository
+                    .findById(new ThinkerMessageId(messageId, config.getWebhookId()))
+                    .map(ThinkerMessage::getChannelId)
+                    .orElse(config.getChannelId());
+            return Optional.of(new MessageRef(channelId, messageId));
+        } catch (NumberFormatException e) {
+            return Optional.empty();
+        }
+    }
+
+    private RestAction<Message> retrieveMessage(MessageRef ref, ThinkerConfig config) {
+        GuildMessageChannel source = jda.getChannelById(GuildMessageChannel.class, ref.channelId());
+        if (source == null || !isEligibleSource(source, config)) {
+            return new CompletedRestAction<>(jda, new UnavailableChannelException(ref.channelId()));
+        }
+        return source.retrieveMessageById(ref.messageId());
     }
 
     @Override
@@ -254,49 +342,40 @@ public class Thinker extends ListenerAdapter {
             }
 
             ThinkerConfig config = configOpt.get();
-            jda.retrieveWebhookById(config.getWebhookId())
+            String messageOption = event.getOption(THINKER_COMMAND_MESSAGE_PARAM_NAME, OptionMapping::getAsString);
+            if (messageOption == null || messageOption.isBlank()) {
+                sendRandomMessageImmediate(config)
+                        .flatMap(message -> message == null
+                                ? hook.editOriginal("No messages available to think of yet. Run /thinkercollect first.")
+                                : hook.editOriginal("Thought of a random message: " + message.getJumpUrl()))
+                        .queue();
+                return;
+            }
+
+            Optional<MessageRef> ref = resolveMessageRef(messageOption, config);
+            if (ref.isEmpty()) {
+                hook.editOriginal(INVALID_MESSAGE_REFERENCE).queue();
+                return;
+            }
+
+            retrieveMessage(ref.get(), config)
+                    .flatMap(msg -> {
+                        if (containsBlockedWord(msg, config)) {
+                            discardBlockedMessage(msg, config);
+                            return hook.editOriginal(
+                                    "That message contains a trigger word (or %s), so the Thinker won't repost it."
+                                            .formatted(MarkdownUtil.monospace(ALWAYS_BLOCKED_WORD)));
+                        }
+                        return sendMessageImmediate(msg, config)
+                                .flatMap(message -> message == null
+                                        ? hook.editOriginal(
+                                                "Couldn't send that message; the Thinker may not be fully set up.")
+                                        : hook.editOriginal("Thought of a specific message: " + message.getJumpUrl()));
+                    })
                     .queue(
-                            webhook -> {
-                                GuildMessageChannel channel =
-                                        webhook.getChannel().asGuildMessageChannel();
-                                String messageIdOption =
-                                        event.getOption(THINKER_COMMAND_MESSAGE_PARAM_NAME, OptionMapping::getAsString);
-                                if (messageIdOption == null || messageIdOption.isBlank()) {
-                                    sendRandomMessageImmediate(channel, config)
-                                            .flatMap(message -> message == null
-                                                    ? hook.editOriginal(
-                                                            "No messages available to think of yet. Run /thinkercollect first.")
-                                                    : hook.editOriginal(
-                                                            "Thought of a random message: " + message.getJumpUrl()))
-                                            .queue();
-                                } else {
-                                    long messageId;
-                                    try {
-                                        messageId = Long.parseLong(messageIdOption.trim());
-                                    } catch (NumberFormatException e) {
-                                        hook.editOriginal("Invalid message ID.").queue();
-                                        return;
-                                    }
-                                    channel.retrieveMessageById(messageId)
-                                            .flatMap(msg -> {
-                                                if (containsBlockedWord(msg, config)) {
-                                                    discardBlockedMessage(msg, config);
-                                                    return hook.editOriginal(
-                                                            "That message contains a trigger word (or %s), so the Thinker won't repost it."
-                                                                    .formatted(MarkdownUtil.monospace(
-                                                                            ALWAYS_BLOCKED_WORD)));
-                                                }
-                                                return sendMessageImmediate(msg, config)
-                                                        .flatMap(message -> message == null
-                                                                ? hook.editOriginal(
-                                                                        "Couldn't send that message; the Thinker may not be fully set up.")
-                                                                : hook.editOriginal("Thought of a specific message: "
-                                                                        + message.getJumpUrl()));
-                                            })
-                                            .queue();
-                                }
-                            },
-                            error -> hook.editOriginal("Failed to retrieve webhook: %s".formatted(error.getMessage()))
+                            null,
+                            error -> hook.editOriginal(
+                                            "Failed to repost that message: %s".formatted(error.getMessage()))
                                     .queue());
         });
     }
@@ -312,26 +391,22 @@ public class Thinker extends ListenerAdapter {
             }
 
             ThinkerConfig config = configOpt.get();
-            String messageIdOption = event.getOption(THINKER_COMMAND_MESSAGE_PARAM_NAME, OptionMapping::getAsString);
+            String messageOption = event.getOption(THINKER_COMMAND_MESSAGE_PARAM_NAME, OptionMapping::getAsString);
 
-            if (messageIdOption == null || messageIdOption.isBlank()) {
-                setPresetMessageId(config, null);
+            if (messageOption == null || messageOption.isBlank()) {
+                setPreset(config, null);
                 hook.editOriginal("Preset message cleared. The Thinker will think of a random message next.")
                         .queue();
                 return;
             }
 
-            long messageId;
-            try {
-                messageId = Long.parseLong(messageIdOption.trim());
-            } catch (NumberFormatException e) {
-                hook.editOriginal("Invalid message ID.").queue();
+            Optional<MessageRef> ref = resolveMessageRef(messageOption, config);
+            if (ref.isEmpty()) {
+                hook.editOriginal(INVALID_MESSAGE_REFERENCE).queue();
                 return;
             }
 
-            event.getChannel()
-                    .asGuildMessageChannel()
-                    .retrieveMessageById(messageId)
+            retrieveMessage(ref.get(), config)
                     .queue(
                             message -> {
                                 if (containsBlockedWord(message, config)) {
@@ -342,23 +417,25 @@ public class Thinker extends ListenerAdapter {
                                             .queue();
                                     return;
                                 }
-                                setPresetMessageId(config, messageId);
+                                setPreset(
+                                        config,
+                                        new MessageRef(message.getChannel().getIdLong(), message.getIdLong()));
                                 hook.editOriginal(
                                                 "Preset the next message: %s\nIt will be posted the next time the Thinker speaks (trigger, reply, or idle timer)."
                                                         .formatted(message.getJumpUrl()))
                                         .queue();
                             },
-                            error -> hook.editOriginal("Failed to find that message in this channel: %s"
-                                            .formatted(error.getMessage()))
+                            error -> hook.editOriginal("Failed to find that message: %s".formatted(error.getMessage()))
                                     .queue());
         });
     }
 
-    private void setPresetMessageId(ThinkerConfig config, Long messageId) {
+    private void setPreset(ThinkerConfig config, MessageRef ref) {
         ReentrantLock lock = sendLocks.computeIfAbsent(config.getWebhookId(), k -> new ReentrantLock());
         lock.lock();
         try {
-            config.setPresetMessageId(messageId);
+            config.setPresetChannelId(ref == null ? null : ref.channelId());
+            config.setPresetMessageId(ref == null ? null : ref.messageId());
             configRepository.save(config);
         } finally {
             lock.unlock();
@@ -406,6 +483,12 @@ public class Thinker extends ListenerAdapter {
                 return;
             }
 
+            Guild guild = event.getGuild();
+            if (guild == null) {
+                hook.editOriginal("This command can only be used in a server.").queue();
+                return;
+            }
+
             ThinkerConfig config = configOpt.get();
             if (!collectingWebhookIds.add(config.getWebhookId())) {
                 hook.editOriginal("A collection is already running for this channel. Wait for it to finish.")
@@ -413,173 +496,172 @@ public class Thinker extends ListenerAdapter {
                 return;
             }
 
-            jda.retrieveWebhookById(config.getWebhookId())
-                    .queue(
-                            webhook -> {
-                                GuildMessageChannel channel =
-                                        webhook.getChannel().asGuildMessageChannel();
+            List<GuildMessageChannel> sources = getSourceChannels(guild, config);
+            hook.editOriginal(
+                            "Collecting messages from %d channels. On a busy server this can take a while; if this message stops updating, the result is in the bot log."
+                                    .formatted(sources.size()))
+                    .queue();
 
-                                hook.editOriginal(
-                                                "Collecting messages. On a busy channel this can take a while; if this message stops updating, the result is in the bot log.")
-                                        .queue();
-
-                                CompletableFuture.runAsync(() -> {
-                                            long startCount = messageRepository.countByWebhookId(config.getWebhookId());
-                                            List<ThinkerMessage> messagesToSave = new ArrayList<>();
-                                            AtomicLong savedCount = new AtomicLong(0);
-
-                                            log.info(
-                                                    "Starting Thinker message collection for webhook {}. Current messages in database: {}",
-                                                    config.getWebhookId(),
-                                                    startCount);
-
-                                            channel.getIterableHistory()
-                                                    .cache(false)
-                                                    .forEach(message -> {
-                                                        if (shouldSaveMessage(message, config)) {
-                                                            ThinkerMessage thinkerMessage = new ThinkerMessage(
-                                                                    message.getIdLong(),
-                                                                    message.getChannel()
-                                                                            .getIdLong(),
-                                                                    message.getGuild()
-                                                                            .getIdLong(),
-                                                                    config.getWebhookId());
-
-                                                            messagesToSave.add(thinkerMessage);
-
-                                                            if (messagesToSave.size() >= 1000) {
-                                                                List<ThinkerMessage> batch =
-                                                                        new ArrayList<>(messagesToSave);
-                                                                messagesToSave.clear();
-
-                                                                List<Long> messageIds = batch.stream()
-                                                                        .map(ThinkerMessage::getMessageId)
-                                                                        .toList();
-                                                                Set<Long> existingIds = new HashSet<>(
-                                                                        messageRepository.findExistingMessageIds(
-                                                                                config.getWebhookId(), messageIds));
-
-                                                                List<ThinkerMessage> newMessages = batch.stream()
-                                                                        .filter(msg -> !existingIds.contains(
-                                                                                msg.getMessageId()))
-                                                                        .toList();
-
-                                                                if (!newMessages.isEmpty()) {
-                                                                    try {
-                                                                        messageRepository.saveAll(newMessages);
-                                                                        long saved = savedCount.addAndGet(
-                                                                                newMessages.size());
-                                                                        if (saved % 10000 == 0) {
-                                                                            log.info("Saved {} messages total", saved);
-                                                                        }
-                                                                    } catch (Exception e) {
-                                                                        log.error(
-                                                                                "Failed to save batch: {}",
-                                                                                e.getMessage());
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    });
-
-                                            if (!messagesToSave.isEmpty()) {
-                                                List<Long> messageIds = messagesToSave.stream()
-                                                        .map(ThinkerMessage::getMessageId)
-                                                        .toList();
-                                                Set<Long> existingIds =
-                                                        new HashSet<>(messageRepository.findExistingMessageIds(
-                                                                config.getWebhookId(), messageIds));
-
-                                                List<ThinkerMessage> newMessages = messagesToSave.stream()
-                                                        .filter(msg -> !existingIds.contains(msg.getMessageId()))
-                                                        .toList();
-
-                                                if (!newMessages.isEmpty()) {
-                                                    try {
-                                                        messageRepository.saveAll(newMessages);
-                                                        savedCount.addAndGet(newMessages.size());
-                                                    } catch (Exception e) {
-                                                        log.error("Failed to save batch: {}", e.getMessage());
-                                                    }
-                                                }
-                                            }
-
-                                            long endCount = messageRepository.countByWebhookId(config.getWebhookId());
-                                            long collected = endCount - startCount;
-
-                                            log.info(
-                                                    "Collection complete for webhook {}. Collected {} messages. Total in database: {}",
-                                                    config.getWebhookId(),
-                                                    collected,
-                                                    endCount);
-
-                                            hook.editOriginal("Collected %d messages. Total messages in database: %d"
-                                                            .formatted(collected, endCount))
-                                                    .queue(
-                                                            null,
-                                                            reportError -> log.warn(
-                                                                    "Could not report the collection result for webhook {}, the interaction has likely expired: {}",
-                                                                    config.getWebhookId(),
-                                                                    reportError.getMessage()));
-                                        })
-                                        .whenComplete((ignored, error) -> {
-                                            collectingWebhookIds.remove(config.getWebhookId());
-                                            if (error != null) {
-                                                log.error(
-                                                        "Thinker message collection failed for webhook {}",
-                                                        config.getWebhookId(),
-                                                        error);
-                                            }
-                                        });
-                            },
-                            error -> {
-                                collectingWebhookIds.remove(config.getWebhookId());
-                                hook.editOriginal("Failed to retrieve webhook: %s".formatted(error.getMessage()))
-                                        .queue();
-                            });
+            CompletableFuture.runAsync(() -> collectMessages(sources, config, hook))
+                    .whenComplete((ignored, error) -> {
+                        collectingWebhookIds.remove(config.getWebhookId());
+                        if (error != null) {
+                            log.error("Thinker message collection failed for webhook {}", config.getWebhookId(), error);
+                        }
+                    });
         });
+    }
+
+    private void collectMessages(List<GuildMessageChannel> sources, ThinkerConfig config, InteractionHook hook) {
+        long webhookId = config.getWebhookId();
+        long startCount = messageRepository.countByWebhookId(webhookId);
+        log.info(
+                "Starting Thinker message collection for webhook {} across {} channels. Current messages in database: {}",
+                webhookId,
+                sources.size(),
+                startCount);
+
+        long savedCount = 0;
+        for (int i = 0; i < sources.size(); i++) {
+            GuildMessageChannel source = sources.get(i);
+            try {
+                savedCount += collectChannel(source, config);
+            } catch (Exception e) {
+                log.warn(
+                        "Failed to collect messages from channel {} ({}) for webhook {}",
+                        source.getName(),
+                        source.getId(),
+                        webhookId,
+                        e);
+            }
+            hook.editOriginal("Collected %d new messages so far (%d/%d channels done)."
+                            .formatted(savedCount, i + 1, sources.size()))
+                    .queue(
+                            null,
+                            error -> log.debug(
+                                    "Could not report collection progress for webhook {}: {}",
+                                    webhookId,
+                                    error.getMessage()));
+        }
+
+        long endCount = messageRepository.countByWebhookId(webhookId);
+        log.info(
+                "Collection complete for webhook {}. Collected {} messages from {} channels. Total in database: {}",
+                webhookId,
+                endCount - startCount,
+                sources.size(),
+                endCount);
+
+        hook.editOriginal("Collected %d messages from %d channels. Total messages in database: %d"
+                        .formatted(endCount - startCount, sources.size(), endCount))
+                .queue(
+                        null,
+                        reportError -> log.warn(
+                                "Could not report the collection result for webhook {}, the interaction has likely expired: {}",
+                                webhookId,
+                                reportError.getMessage()));
+    }
+
+    private long collectChannel(GuildMessageChannel source, ThinkerConfig config) {
+        log.info(
+                "Collecting messages from channel {} ({}) for webhook {}",
+                source.getName(),
+                source.getId(),
+                config.getWebhookId());
+
+        AtomicLong savedCount = new AtomicLong();
+        List<ThinkerMessage> batch = new ArrayList<>();
+        source.getIterableHistory().cache(false).forEach(message -> {
+            if (shouldSaveMessage(message, config)) {
+                batch.add(toThinkerMessage(message, config));
+                if (batch.size() >= COLLECT_BATCH_SIZE) {
+                    savedCount.addAndGet(saveBatch(batch, config));
+                }
+            }
+        });
+        savedCount.addAndGet(saveBatch(batch, config));
+
+        log.info(
+                "Collected {} new messages from channel {} ({}) for webhook {}",
+                savedCount.get(),
+                source.getName(),
+                source.getId(),
+                config.getWebhookId());
+        return savedCount.get();
+    }
+
+    private long saveBatch(List<ThinkerMessage> batch, ThinkerConfig config) {
+        if (batch.isEmpty()) {
+            return 0;
+        }
+
+        List<Long> messageIds = batch.stream().map(ThinkerMessage::getMessageId).toList();
+        Set<Long> existingIds =
+                new HashSet<>(messageRepository.findExistingMessageIds(config.getWebhookId(), messageIds));
+        List<ThinkerMessage> newMessages = batch.stream()
+                .filter(message -> !existingIds.contains(message.getMessageId()))
+                .toList();
+        batch.clear();
+
+        if (newMessages.isEmpty()) {
+            return 0;
+        }
+
+        try {
+            messageRepository.saveAll(newMessages);
+            return newMessages.size();
+        } catch (Exception e) {
+            log.error("Failed to save batch: {}", e.getMessage());
+            return 0;
+        }
     }
 
     @Override
     public void onMessageReceived(@NotNull MessageReceivedEvent event) {
-        if (!event.isFromType(ChannelType.TEXT) || event.getMessage().isWebhookMessage()) return;
+        if (!event.isFromGuild() || event.getMessage().isWebhookMessage()) return;
 
         Message message = event.getMessage();
-        GuildMessageChannel channel = event.getChannel().asGuildMessageChannel();
+        GuildMessageChannel channel = event.getGuildChannel();
 
-        getConfigForChannel(event.getChannel().getIdLong()).ifPresent(config -> {
-            Long defaultUserId = webhookDefaultUserIds.get(config.getWebhookId());
-            if (defaultUserId != null) {
-                handleReceivedMessage(config, defaultUserId, message, channel);
-            } else {
-                jda.retrieveWebhookById(config.getWebhookId())
-                        .queue(
-                                webhook -> {
-                                    long resolved = webhook.getDefaultUser().getIdLong();
-                                    webhookDefaultUserIds.put(config.getWebhookId(), resolved);
-                                    handleReceivedMessage(config, resolved, message, channel);
-                                },
-                                error -> log.warn(
-                                        "Failed to resolve webhook {} for received message: {}",
-                                        config.getWebhookId(),
-                                        error.getMessage()));
-            }
-        });
+        configs.values().stream()
+                .filter(config -> isEligibleSource(channel, config))
+                .forEach(config -> {
+                    trackMessage(message, config);
+                    if (channel.getIdLong() == config.getChannelId()) {
+                        respondIfTriggered(config, message);
+                    }
+                });
     }
 
-    private void handleReceivedMessage(
-            ThinkerConfig config, long webhookDefaultUserId, Message message, GuildMessageChannel channel) {
-        if (message.getAuthor().getIdLong() == webhookDefaultUserId) {
+    private void trackMessage(Message message, ThinkerConfig config) {
+        if (shouldSaveMessage(message, config)) {
+            messageRepository.save(toThinkerMessage(message, config));
+        }
+    }
+
+    private void respondIfTriggered(ThinkerConfig config, Message message) {
+        Long defaultUserId = webhookDefaultUserIds.get(config.getWebhookId());
+        if (defaultUserId != null) {
+            respondIfTriggered(config, defaultUserId, message);
             return;
         }
 
-        if (shouldSaveMessage(message, config)) {
-            ThinkerMessage thinkerMessage = new ThinkerMessage(
-                    message.getIdLong(),
-                    message.getChannel().getIdLong(),
-                    message.getGuild().getIdLong(),
-                    config.getWebhookId());
-            messageRepository.save(thinkerMessage);
+        jda.retrieveWebhookById(config.getWebhookId())
+                .queue(
+                        webhook -> {
+                            long resolved = webhook.getDefaultUser().getIdLong();
+                            webhookDefaultUserIds.put(config.getWebhookId(), resolved);
+                            respondIfTriggered(config, resolved, message);
+                        },
+                        error -> log.warn(
+                                "Failed to resolve webhook {} for received message: {}",
+                                config.getWebhookId(),
+                                error.getMessage()));
+    }
+
+    private void respondIfTriggered(ThinkerConfig config, long webhookDefaultUserId, Message message) {
+        if (message.getAuthor().getIdLong() == webhookDefaultUserId) {
+            return;
         }
 
         boolean isReply = !config.getTriggers().isEmpty()
@@ -591,7 +673,7 @@ public class Thinker extends ListenerAdapter {
                 config.getTriggers().stream().anyMatch(trigger -> content.contains(trigger.toLowerCase(Locale.ROOT)));
 
         if (isReply || hasChatTrigger) {
-            sendRandomMessageImmediate(channel, config).queue();
+            sendRandomMessageImmediate(config).queue();
         }
     }
 
@@ -608,14 +690,14 @@ public class Thinker extends ListenerAdapter {
                 && !containsBlockedWord(message, config);
     }
 
-    private RestAction<Message> sendRandomMessageImmediate(GuildMessageChannel channel, ThinkerConfig config) {
+    private RestAction<Message> sendRandomMessageImmediate(ThinkerConfig config) {
         long webhookId = config.getWebhookId();
         if (!tryAcquireSendLease(webhookId)) {
             log.info("A send is already in progress for webhook {}, refusing to send another message", webhookId);
             return new CompletedRestAction<>(jda, null);
         }
 
-        return releasingSendLease(webhookId, sendNextMessage(channel, config));
+        return releasingSendLease(webhookId, sendNextMessage(config));
     }
 
     private boolean tryAcquireSendLease(long webhookId) {
@@ -642,44 +724,35 @@ public class Thinker extends ListenerAdapter {
                 });
     }
 
-    private RestAction<Message> sendNextMessage(GuildMessageChannel channel, ThinkerConfig config) {
-        Long presetMessageId = consumePresetMessageId(config);
-        if (presetMessageId == null) {
-            return selectAndSendRandomMessage(channel, config, 0);
+    private RestAction<Message> sendNextMessage(ThinkerConfig config) {
+        MessageRef preset = consumePreset(config);
+        if (preset == null) {
+            return selectAndSendRandomMessage(config, 0);
         }
 
-        log.info("Sending preset message {} for webhook {}", presetMessageId, config.getWebhookId());
-        return channel.retrieveMessageById(presetMessageId)
-                .flatMap(msg -> {
-                    if (containsBlockedWord(msg, config)) {
-                        discardBlockedMessage(msg, config);
-                        return selectAndSendRandomMessage(channel, config, 0);
-                    }
-                    return sendMessageImmediate(msg, config);
-                })
-                .onErrorFlatMap(ErrorResponse.UNKNOWN_MESSAGE::test, error -> {
-                    discardMissingMessage(presetMessageId, config);
-                    return selectAndSendRandomMessage(channel, config, 0);
-                });
+        log.info("Sending preset message {} for webhook {}", preset.messageId(), config.getWebhookId());
+        return sendStoredMessage(preset, config, () -> selectAndSendRandomMessage(config, 0));
     }
 
-    private Long consumePresetMessageId(ThinkerConfig config) {
+    private MessageRef consumePreset(ThinkerConfig config) {
         ReentrantLock lock = sendLocks.computeIfAbsent(config.getWebhookId(), k -> new ReentrantLock());
         lock.lock();
         try {
             Long presetMessageId = config.getPresetMessageId();
-            if (presetMessageId != null) {
-                config.setPresetMessageId(null);
-                configRepository.save(config);
+            if (presetMessageId == null) {
+                return null;
             }
-            return presetMessageId;
+            Long presetChannelId = config.getPresetChannelId();
+            config.setPresetChannelId(null);
+            config.setPresetMessageId(null);
+            configRepository.save(config);
+            return new MessageRef(presetChannelId != null ? presetChannelId : config.getChannelId(), presetMessageId);
         } finally {
             lock.unlock();
         }
     }
 
-    private RestAction<Message> selectAndSendRandomMessage(
-            GuildMessageChannel channel, ThinkerConfig config, int attempt) {
+    private RestAction<Message> selectAndSendRandomMessage(ThinkerConfig config, int attempt) {
         if (attempt >= MAX_SEND_ATTEMPTS) {
             log.warn(
                     "Found no postable message for webhook {} after {} attempts, refusing to post",
@@ -702,19 +775,30 @@ public class Thinker extends ListenerAdapter {
         }
 
         return randomMessage
-                .map(thinkerMessage -> channel.retrieveMessageById(thinkerMessage.getMessageId())
-                        .flatMap(msg -> {
-                            if (containsBlockedWord(msg, config)) {
-                                discardBlockedMessage(msg, config);
-                                return selectAndSendRandomMessage(channel, config, attempt + 1);
-                            }
-                            return sendMessageImmediate(msg, config);
-                        })
-                        .onErrorFlatMap(ErrorResponse.UNKNOWN_MESSAGE::test, error -> {
-                            discardMissingMessage(thinkerMessage.getMessageId(), config);
-                            return selectAndSendRandomMessage(channel, config, attempt + 1);
-                        }))
+                .map(thinkerMessage -> sendStoredMessage(
+                        new MessageRef(thinkerMessage.getChannelId(), thinkerMessage.getMessageId()),
+                        config,
+                        () -> selectAndSendRandomMessage(config, attempt + 1)))
                 .orElseGet(() -> new CompletedRestAction<>(jda, null));
+    }
+
+    private RestAction<Message> sendStoredMessage(
+            MessageRef ref, ThinkerConfig config, Supplier<RestAction<Message>> fallback) {
+        return retrieveMessage(ref, config)
+                .onErrorFlatMap(UNAVAILABLE_MESSAGE_ERRORS, error -> {
+                    discardUnavailableMessage(ref, config, error);
+                    return new CompletedRestAction<>(jda, null);
+                })
+                .flatMap(message -> {
+                    if (message == null) {
+                        return fallback.get();
+                    }
+                    if (containsBlockedWord(message, config)) {
+                        discardBlockedMessage(message, config);
+                        return fallback.get();
+                    }
+                    return sendMessageImmediate(message, config);
+                });
     }
 
     private RestAction<Message> sendMessageImmediate(Message message, ThinkerConfig config) {
@@ -735,18 +819,26 @@ public class Thinker extends ListenerAdapter {
     }
 
     @Override
-    public void onMessageBulkDelete(MessageBulkDeleteEvent event) {
-        getConfigForChannel(event.getChannel().getIdLong())
-                .ifPresent(config -> messageRepository.deleteByWebhookIdAndMessageIdIn(
-                        config.getWebhookId(),
-                        event.getMessageIds().stream().map(Long::valueOf).toList()));
+    public void onMessageBulkDelete(@NotNull MessageBulkDeleteEvent event) {
+        messageRepository.deleteByMessageIdIn(
+                event.getMessageIds().stream().map(Long::valueOf).toList());
     }
 
     @Override
-    public void onMessageDelete(MessageDeleteEvent event) {
-        getConfigForChannel(event.getChannel().getIdLong())
-                .ifPresent(config -> messageRepository.deleteByWebhookIdAndMessageIdIn(
-                        config.getWebhookId(), List.of(event.getMessageIdLong())));
+    public void onMessageDelete(@NotNull MessageDeleteEvent event) {
+        messageRepository.deleteByMessageIdIn(List.of(event.getMessageIdLong()));
+    }
+
+    @Override
+    public void onChannelDelete(@NotNull ChannelDeleteEvent event) {
+        messageRepository.deleteByChannelId(event.getChannel().getIdLong());
+    }
+
+    @Override
+    public void onChannelUpdateArchived(@NotNull ChannelUpdateArchivedEvent event) {
+        if (Boolean.TRUE.equals(event.getNewValue())) {
+            messageRepository.deleteByChannelId(event.getChannel().getIdLong());
+        }
     }
 
     @PostConstruct
@@ -763,7 +855,10 @@ public class Thinker extends ListenerAdapter {
 
             guild.upsertCommand(THINKER_COMMAND_NAME, "Triggers the Thinker")
                     .setDefaultPermissions(DefaultMemberPermissions.enabledFor(Permission.MANAGE_WEBHOOKS))
-                    .addOption(OptionType.STRING, THINKER_COMMAND_MESSAGE_PARAM_NAME, "The message ID to copy")
+                    .addOption(
+                            OptionType.STRING,
+                            THINKER_COMMAND_MESSAGE_PARAM_NAME,
+                            "The ID or link of the message to copy (from any channel in this server)")
                     .queue();
 
             guild.upsertCommand(THINKER_TRIGGER_COMMAND_NAME, "Sets a new trigger word for the thinker")
@@ -771,7 +866,7 @@ public class Thinker extends ListenerAdapter {
                     .addOption(OptionType.STRING, THINKER_TRIGGER_COMMAND_TRIGGER_PARAM_NAME, "The new trigger word")
                     .queue();
 
-            guild.upsertCommand(THINKER_COLLECT_COMMAND_NAME, "Collects messages from the webhook channel")
+            guild.upsertCommand(THINKER_COLLECT_COMMAND_NAME, "Collects messages from every channel in this server")
                     .setDefaultPermissions(DefaultMemberPermissions.enabledFor(Permission.MANAGE_WEBHOOKS))
                     .queue();
 
@@ -780,7 +875,7 @@ public class Thinker extends ListenerAdapter {
                     .addOption(
                             OptionType.STRING,
                             THINKER_COMMAND_MESSAGE_PARAM_NAME,
-                            "The message ID to pre-set (omit to clear the preset)")
+                            "The ID or link of the message to pre-set (omit to clear the preset)")
                     .queue();
         });
 
@@ -814,7 +909,7 @@ public class Thinker extends ListenerAdapter {
                             GuildMessageChannel channel = webhook.getChannel().asGuildMessageChannel();
                             return channel.getHistory()
                                     .retrievePast(100)
-                                    .flatMap(messages -> sendRandomMessageIfDue(channel, config, webhook, messages));
+                                    .flatMap(messages -> sendRandomMessageIfDue(config, webhook, messages));
                         })
                         .submit()
                         .orTimeout(30, TimeUnit.SECONDS)
@@ -826,7 +921,7 @@ public class Thinker extends ListenerAdapter {
     }
 
     private RestAction<Message> sendRandomMessageIfDue(
-            GuildMessageChannel channel, ThinkerConfig config, Webhook webhook, List<Message> recentMessages) {
+            ThinkerConfig config, Webhook webhook, List<Message> recentMessages) {
         Duration duration = getAvgDurationBetweenMessages(recentMessages);
         OffsetDateTime lastPosted = lastPostedTimes.getOrDefault(config.getWebhookId(), OffsetDateTime.now());
 
@@ -844,6 +939,6 @@ public class Thinker extends ListenerAdapter {
             return new CompletedRestAction<>(jda, null);
         }
 
-        return sendRandomMessageImmediate(channel, config);
+        return sendRandomMessageImmediate(config);
     }
 }

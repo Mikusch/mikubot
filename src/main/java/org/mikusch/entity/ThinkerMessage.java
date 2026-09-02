@@ -2,13 +2,16 @@ package org.mikusch.entity;
 
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
+import jakarta.persistence.IdClass;
+import jakarta.persistence.Index;
 import jakarta.persistence.Table;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
 @Entity
-@Table(name = "thinker_messages")
+@Table(name = "thinker_messages", indexes = @Index(name = "idx_thinker_messages_webhook_id", columnList = "webhook_id"))
+@IdClass(ThinkerMessageId.class)
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
@@ -21,5 +24,6 @@ public class ThinkerMessage {
 
     private Long guildId;
 
+    @Id
     private Long webhookId;
 }

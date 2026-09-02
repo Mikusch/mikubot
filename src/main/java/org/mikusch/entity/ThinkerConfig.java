@@ -22,6 +22,8 @@ public class ThinkerConfig {
 
     private long durationMultiplier = 40L;
 
+    private volatile Long presetChannelId;
+
     private volatile Long presetMessageId;
 
     public ThinkerConfig(Long webhookId, Long channelId) {
